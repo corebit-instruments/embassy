@@ -514,6 +514,11 @@ mod dual_core {
                 )
             }
 
+            #[cfg(feature = "exti")]
+            unsafe {
+                exti::init(cs);
+            }
+
             #[cfg(feature = "_time-driver")]
             // must be after rcc init
             time_driver::init(cs);
