@@ -107,7 +107,7 @@ alloc = ["smoltcp/alloc"]
 defmt = { version = "1.0.1", optional = true }
 log = { version = "0.4.14", optional = true }
 
-smoltcp = { version = "0.12.0", default-features = false, features = [
+smoltcp = { git = "https://github.com/modulo-org/smoltcp.git", rev = "b08b70fae46f3d2d9b782fea3380bac8f40ce004", default-features = false, features = [
   "socket",
   "async",
 ] }
