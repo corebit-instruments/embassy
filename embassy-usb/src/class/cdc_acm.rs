@@ -328,6 +328,14 @@ impl<'d, D: Driver<'d>> CdcAcmClass<'d, D> {
         self.control.rts.load(Ordering::Relaxed)
     }
 
+    /// Borrow the IN endpoint for driver-specific transfer operations.
+    ///
+    /// The mutable borrow keeps endpoint writes exclusive. The caller must
+    /// preserve CDC byte ordering and terminate exact-packet tails with a ZLP.
+    pub fn write_endpoint(&mut self) -> &mut D::EndpointIn {
+        &mut self.write_ep
+    }
+
     /// Writes a single packet into the IN endpoint.
     pub async fn write_packet(&mut self, data: &[u8]) -> Result<(), EndpointError> {
         self.write_ep.write(data).await

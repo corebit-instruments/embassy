@@ -27,3 +27,6 @@ log = { version = "0.4.14", optional = true }
 [features]
 defmt = ["dep:defmt", "embassy-usb-driver/defmt"]
 log = ["dep:log"]
+
+[dev-dependencies]
+critical-section = { version = "1.1", features = ["std"] }

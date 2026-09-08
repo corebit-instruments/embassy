@@ -25,6 +25,9 @@ pub mod otg_v1;
 
 use otg_v1::{Otg, regs, vals};
 
+#[cfg(test)]
+mod bulk_tests;
+
 /// Handle interrupts.
 pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_EP_COUNT>, ep_count: usize) {
     trace!("irq");
@@ -350,6 +353,10 @@ pub struct Config {
     /// enumerates in FS mode. Some USB Link IP like those in the STM32H7 series support adding this delay to work with
     /// the affected PHYs.
     pub xcvrdly: bool,
+
+    /// Minimum FIFO words reserved per bulk IN endpoint. Zero retains the
+    /// upstream one-packet allocation. Larger FIFOs enable `write_bulk`.
+    pub bulk_in_fifo_words: u16,
 }
 
 impl Default for Config {
@@ -357,6 +364,7 @@ impl Default for Config {
         Self {
             vbus_detection: false,
             xcvrdly: false,
+            bulk_in_fifo_words: 0,
         }
     }
 }
@@ -423,10 +431,22 @@ impl<'d, const MAX_EP_COUNT: usize> Driver<'d, MAX_EP_COUNT> {
         let fifo_size_words = match D::dir() {
             Direction::Out => (max_packet_size + 3) / 4,
             // INEPTXFD requires minimum size of 16 words
-            Direction::In => u16::max((max_packet_size + 3) / 4, 16),
+            Direction::In => {
+                let minimum = u16::max((max_packet_size + 3) / 4, 16);
+                if ep_type == EndpointType::Bulk {
+                    minimum.max(self.config.bulk_in_fifo_words)
+                } else {
+                    minimum
+                }
+            }
         };
 
-        if fifo_size_words + self.allocated_fifo_words() > self.instance.fifo_depth_words {
+        if fifo_size_words
+            > self
+                .instance
+                .fifo_depth_words
+                .saturating_sub(self.allocated_fifo_words())
+        {
             error!("Not enough FIFO capacity");
             return Err(EndpointAllocError);
         }
@@ -492,6 +512,7 @@ impl<'d, const MAX_EP_COUNT: usize> Driver<'d, MAX_EP_COUNT> {
             _phantom: PhantomData,
             regs: self.instance.regs,
             state,
+            fifo_size_words,
             info: EndpointInfo {
                 addr: EndpointAddress::from_parts(index, D::dir()),
                 ep_type,
@@ -1074,6 +1095,7 @@ impl Dir for Out {
 
 /// USB endpoint.
 pub struct Endpoint<'d, D> {
+    fifo_size_words: u16,
     _phantom: PhantomData<D>,
     regs: Otg,
     info: EndpointInfo,
@@ -1191,12 +1213,31 @@ impl<'d> embassy_usb_driver::EndpointOut for Endpoint<'d, Out> {
 
 impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
     async fn write(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
-        trace!("write ep={:?} data={:?}", self.info.addr, Bytes(buf));
-
         if buf.len() > self.info.max_packet_size as usize {
             return Err(EndpointError::BufferOverflow);
         }
+        self.write_transfer(buf).await
+    }
+}
 
+impl<'d> Endpoint<'d, In> {
+    /// Write a bounded bulk transfer without rearming between its packets.
+    /// All bytes must fit the allocated FIFO, and at most four packets may be
+    /// armed. Endpoint max-packet size and ordinary `write` semantics do not
+    /// change. The caller terminates exact-packet tails with a separate ZLP.
+    /// Like `write`, cancellation before Ready has not accepted any bytes;
+    /// Ready means the entire transfer has been copied into the peripheral.
+    pub async fn write_bulk(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
+        if self.info.ep_type != EndpointType::Bulk
+            || buf.len() > usize::from(self.fifo_size_words) * 4
+            || buf.len() > usize::from(self.info.max_packet_size) * 4
+        {
+            return Err(EndpointError::BufferOverflow);
+        }
+        self.write_transfer(buf).await
+    }
+
+    async fn write_transfer(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
         let index = self.info.addr.index();
         // Wait for previous transfer to complete and check if endpoint is disabled
         poll_fn(|cx| {
@@ -1227,6 +1268,10 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
 
                 let size_words = (buf.len() + 3) / 4;
 
+                if !self.regs.diepctl(index).read().usbaep() {
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
+
                 let fifo_space = self.regs.dtxfsts(index).read().ineptfsav() as usize;
                 if size_words > fifo_space {
                     // Not enough space in fifo, enable tx fifo empty interrupt
@@ -1241,10 +1286,10 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
                     Poll::Pending
                 } else {
                     trace!("write ep={:?} wait for fifo: ready", self.info.addr);
-                    Poll::Ready(())
+                    Poll::Ready(Ok(()))
                 }
             })
-            .await
+            .await?
         }
 
         // ERRATA: Transmit data FIFO is corrupted when a write sequence to the FIFO is interrupted with
@@ -1255,7 +1300,7 @@ impl<'d> embassy_usb_driver::EndpointIn for Endpoint<'d, In> {
             // Setup transfer size
             self.regs.dieptsiz(index).write(|w| {
                 w.set_mcnt(1);
-                w.set_pktcnt(1);
+                w.set_pktcnt(buf.len().div_ceil(usize::from(self.info.max_packet_size)).max(1) as u16);
                 w.set_xfrsiz(buf.len() as _);
             });
 
