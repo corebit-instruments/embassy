@@ -27,6 +27,8 @@ use otg_v1::{Otg, regs, vals};
 
 #[cfg(test)]
 mod bulk_tests;
+#[cfg(test)]
+mod control_tests;
 
 /// Handle interrupts.
 pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_EP_COUNT>, ep_count: usize) {
@@ -1357,6 +1359,29 @@ pub struct ControlPipe<'d> {
     ep_out: Endpoint<'d, Out>,
 }
 
+impl<'d> ControlPipe<'d> {
+    /// Read one data- or status-stage OUT packet of the current transfer. A new
+    /// SETUP means the host abandoned that transfer: end the stage so the caller
+    /// takes the SETUP, which endpoint 0 OUT otherwise NAKs behind forever.
+    async fn read_stage(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
+        let setup_state = self.setup_state;
+        let mut read = core::pin::pin!(self.ep_out.read(buf));
+        poll_fn(|cx| {
+            // Load the flag before polling: a packet that preceded the SETUP is
+            // then already buffered and still completes its own transfer.
+            let abandoned = setup_state.setup_ready.load(Ordering::Acquire);
+            match read.as_mut().poll(cx) {
+                Poll::Pending if abandoned => {
+                    trace!("control: stage abandoned for a new SETUP");
+                    Poll::Ready(Err(EndpointError::Disabled))
+                }
+                result => result,
+            }
+        })
+        .await
+    }
+}
+
 impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
     fn max_packet_size(&self) -> usize {
         usize::from(self.max_packet_size)
@@ -1372,9 +1397,26 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
                 data[4..8].copy_from_slice(&self.setup_state.setup_data[1].load(Ordering::Relaxed).to_ne_bytes());
                 self.setup_state.setup_ready.store(false, Ordering::Release);
 
+                // A new SETUP ends any earlier control transfer. An OUT packet still
+                // buffered belongs to a transfer the host abandoned; left in place it
+                // would stand in for this transfer's data or status stage, and its
+                // occupied buffer would drop the packets this transfer receives. EP0
+                // OUT NAKs from the SETUP until the CNAK below, so this transfer's own
+                // packets have not arrived yet.
+                let stale = self.ep_out.state.out_size.swap(EP_OUT_BUFFER_EMPTY, Ordering::AcqRel);
+                if stale != EP_OUT_BUFFER_EMPTY {
+                    warn!("control: discarded {} stale OUT bytes at SETUP", stale);
+                }
+
                 // EP0 should not be controlled by `Bus` so this RMW does not need a critical section
                 self.regs.doeptsiz(self.ep_out.info.addr.index()).modify(|w| {
                     w.set_rxdpid_stupcnt(3);
+                    if stale != EP_OUT_BUFFER_EMPTY {
+                        // The discarded packet used the receive armed for it; rearm one
+                        // packet as `read` would have after consuming it.
+                        w.set_xfrsiz(self.ep_out.info.max_packet_size as _);
+                        w.set_pktcnt(1);
+                    }
                 });
 
                 // Clear NAK to indicate we are ready to receive more data
@@ -1394,7 +1436,7 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
 
     async fn data_out(&mut self, buf: &mut [u8], _first: bool, _last: bool) -> Result<usize, EndpointError> {
         trace!("control: data_out");
-        let len = self.ep_out.read(buf).await?;
+        let len = self.read_stage(buf).await?;
         trace!("control: data_out read: {:?}", Bytes(&buf[..len]));
         Ok(len)
     }
@@ -1406,7 +1448,7 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
         // wait for status response from host after sending the last packet
         if last {
             trace!("control: data_in waiting for status");
-            self.ep_out.read(&mut []).await?;
+            self.read_stage(&mut []).await?;
             trace!("control: complete");
         }
 
