@@ -43,6 +43,12 @@ pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_
             w.set_rxflvlm(true);
         });
         state.bus_waker.wake();
+        // A control stage in progress keeps `Bus::poll` from running until it
+        // ends; wake it so it sees the event and ends (see `ControlPipe::stage`).
+        if let Some(ep0) = state.ep_states.first() {
+            ep0.in_waker.wake();
+            ep0.out_waker.wake();
+        }
     }
 
     // Handle RX
@@ -1359,7 +1365,53 @@ pub struct ControlPipe<'d> {
     ep_out: Endpoint<'d, Out>,
 }
 
+/// Whether the core has flagged a USB reset, enumeration or suspend that
+/// `Bus::poll` has not handled yet. Each ends the current control transfer.
+/// The flags stay set until `Bus::poll` clears them, so this also covers any
+/// event that occurred since a stage began.
+fn bus_event_pending(regs: Otg) -> bool {
+    let ints = regs.gintsts().read();
+    ints.usbrst() || ints.enumdne() || ints.usbsusp()
+}
+
 impl<'d> ControlPipe<'d> {
+    /// Run one stage of the current control transfer until it completes or a
+    /// bus event ends the transfer.
+    ///
+    /// Endpoint 0 stays active through a USB reset or suspend, so its own waits
+    /// never fail. A stage waiting on a host that reset or suspended the bus
+    /// would wait forever, and `UsbDevice` handles control requests inline, so
+    /// `Bus::poll` would never run to reconfigure endpoint 0 and the device
+    /// could not enumerate again. `on_interrupt` wakes endpoint 0 when it masks
+    /// a bus event; the stage then fails with `Disabled` and cancels any IN
+    /// packet it left armed, so `UsbDevice` returns to `Bus::poll`.
+    async fn stage<T>(regs: Otg, stage: impl Future<Output = Result<T, EndpointError>>) -> Result<T, EndpointError> {
+        let mut stage = core::pin::pin!(stage);
+        poll_fn(|cx| {
+            // Check before polling so a stage does not arm endpoint 0 for a bus
+            // that was already reset, and after a pending poll so an event that
+            // arrived before the stage registered its waker is not missed.
+            if !bus_event_pending(regs) {
+                match stage.as_mut().poll(cx) {
+                    Poll::Pending if bus_event_pending(regs) => {}
+                    result => return result,
+                }
+            }
+            trace!("control: stage ended by a bus event");
+            // An armed IN packet the host never took would otherwise keep EPENA
+            // set and stall the next transfer's first write.
+            if regs.diepctl(0).read().epena() {
+                // EP0 should not be controlled by `Bus` so this RMW does not need a critical section
+                regs.diepctl(0).modify(|w| {
+                    w.set_snak(true);
+                    w.set_epdis(true);
+                });
+            }
+            Poll::Ready(Err(EndpointError::Disabled))
+        })
+        .await
+    }
+
     /// Read one data- or status-stage OUT packet of the current transfer. A new
     /// SETUP means the host abandoned that transfer: end the stage so the caller
     /// takes the SETUP, which endpoint 0 OUT otherwise NAKs behind forever.
@@ -1436,19 +1488,19 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
 
     async fn data_out(&mut self, buf: &mut [u8], _first: bool, _last: bool) -> Result<usize, EndpointError> {
         trace!("control: data_out");
-        let len = self.read_stage(buf).await?;
+        let len = Self::stage(self.regs, self.read_stage(buf)).await?;
         trace!("control: data_out read: {:?}", Bytes(&buf[..len]));
         Ok(len)
     }
 
     async fn data_in(&mut self, data: &[u8], _first: bool, last: bool) -> Result<(), EndpointError> {
         trace!("control: data_in write: {:?}", Bytes(data));
-        self.ep_in.write(data).await?;
+        Self::stage(self.regs, self.ep_in.write(data)).await?;
 
         // wait for status response from host after sending the last packet
         if last {
             trace!("control: data_in waiting for status");
-            self.read_stage(&mut []).await?;
+            Self::stage(self.regs, self.read_stage(&mut [])).await?;
             trace!("control: complete");
         }
 
@@ -1458,7 +1510,7 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
     async fn accept(&mut self) {
         trace!("control: accept");
 
-        self.ep_in.write(&[]).await.ok();
+        Self::stage(self.regs, self.ep_in.write(&[])).await.ok();
 
         trace!("control: accept OK");
     }

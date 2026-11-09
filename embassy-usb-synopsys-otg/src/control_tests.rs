@@ -84,6 +84,13 @@ impl Fixture {
         true
     }
 
+    /// The core flags a bus event in GINTSTS. It stays pending until
+    /// `Bus::poll` handles it, so a control stage that waits on endpoint 0
+    /// instead waits forever.
+    fn host_bus_event(&self, event: impl FnOnce(&mut regs::Gintsts)) {
+        self.regs.gintsts().modify(|w| event(w));
+    }
+
     /// What `on_interrupt` does with a SETUP packet.
     fn host_setup(&self, request: [u8; 8]) {
         let setup = &self.state.cp_state;
@@ -193,4 +200,117 @@ fn an_in_status_stage_completes_when_its_status_packet_precedes_the_next_setup()
         assert_eq!(poll(reply.as_mut()), Poll::Ready(Ok(())));
     }
     assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(SET_LINE_CODING));
+}
+
+/// Polls with a waker that records whether it was woken.
+struct Woken(std::sync::Arc<AtomicBool>);
+
+impl std::task::Wake for Woken {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// The host reset the bus while a multi-packet IN data stage waited for the
+/// previous packet to go out. Endpoint 0 stays active through a reset, so that
+/// wait never ended and `Bus::poll` never ran to handle the reset.
+#[test]
+fn an_in_data_stage_ends_when_the_host_resets_the_bus() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.host_setup(GET_LINE_CODING);
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(GET_LINE_CODING));
+    assert_eq!(
+        poll(core::pin::pin!(pipe.data_in(&[0; 64], true, false))),
+        Poll::Ready(Ok(()))
+    );
+    let mut reply = core::pin::pin!(pipe.data_in(&LINE_CODING_115200, false, true));
+    assert_eq!(
+        poll(reply.as_mut()),
+        Poll::Pending,
+        "the host has not taken the first packet"
+    );
+    fixture.host_bus_event(|w| w.set_usbrst(true));
+    assert_eq!(poll(reply.as_mut()), Poll::Ready(Err(EndpointError::Disabled)));
+    let diepctl = fixture.regs.diepctl(0).read();
+    assert!(diepctl.epdis() && diepctl.snak(), "the armed IN packet is cancelled");
+}
+
+/// The host suspended the bus instead of sending the status packet of an IN
+/// transfer, which is the register state read from the hung DX0.
+#[test]
+fn an_in_status_stage_ends_when_the_host_suspends_the_bus() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.host_setup(GET_LINE_CODING);
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(GET_LINE_CODING));
+    let mut reply = core::pin::pin!(pipe.data_in(&LINE_CODING_115200, true, true));
+    assert_eq!(
+        poll(reply.as_mut()),
+        Poll::Pending,
+        "waits for the host's status packet"
+    );
+    fixture.host_bus_event(|w| w.set_usbsusp(true));
+    assert_eq!(poll(reply.as_mut()), Poll::Ready(Err(EndpointError::Disabled)));
+}
+
+/// The host reset the bus instead of sending the data of a control OUT.
+#[test]
+fn an_out_data_stage_ends_when_the_host_resets_the_bus() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.host_setup(SET_LINE_CODING);
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(SET_LINE_CODING));
+    let mut data = [0; 7];
+    let mut read = core::pin::pin!(pipe.data_out(&mut data, true, true));
+    assert_eq!(poll(read.as_mut()), Poll::Pending);
+    fixture.host_bus_event(|w| w.set_usbrst(true));
+    assert_eq!(poll(read.as_mut()), Poll::Ready(Err(EndpointError::Disabled)));
+}
+
+/// The zero-length status packet of a control OUT waits behind an IN packet
+/// the host never took; enumeration after a reset must end that wait too.
+#[test]
+fn an_out_status_stage_ends_when_the_host_finishes_a_new_enumeration() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.regs.diepctl(0).modify(|w| w.set_epena(true));
+    let mut accept = core::pin::pin!(pipe.accept());
+    assert_eq!(poll(accept.as_mut()), Poll::Pending);
+    fixture.host_bus_event(|w| w.set_enumdne(true));
+    assert_eq!(poll(accept.as_mut()), Poll::Ready(()));
+}
+
+/// A bus event that is already pending when a stage begins ends it before it
+/// arms endpoint 0, so the stage does not queue a packet for a reset bus.
+#[test]
+fn a_control_stage_does_not_arm_endpoint_0_while_a_bus_event_is_pending() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.host_bus_event(|w| w.set_usbrst(true));
+    assert_eq!(
+        poll(core::pin::pin!(pipe.data_in(&LINE_CODING_115200, true, true))),
+        Poll::Ready(Err(EndpointError::Disabled))
+    );
+    assert!(!fixture.regs.diepctl(0).read().epena(), "nothing armed");
+    assert_eq!(fixture.regs.dieptsiz(0).read().xfrsiz(), 0, "nothing queued");
+}
+
+/// The interrupt masks a bus event until `Bus::poll` handles it. It must also
+/// wake the waiting control stage, or that stage never sees the event.
+#[test]
+fn the_interrupt_wakes_a_control_stage_when_it_masks_a_bus_event() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.host_setup(GET_LINE_CODING);
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(GET_LINE_CODING));
+    let mut reply = core::pin::pin!(pipe.data_in(&LINE_CODING_115200, true, true));
+    let woken = std::sync::Arc::new(AtomicBool::new(false));
+    let waker = Waker::from(std::sync::Arc::new(Woken(woken.clone())));
+    assert_eq!(reply.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Pending);
+    fixture.host_bus_event(|w| w.set_usbsusp(true));
+    // SAFETY: fake, owned register bank with no RX data or endpoint interrupts.
+    unsafe { on_interrupt(fixture.regs, fixture.state, 1) };
+    assert!(woken.load(Ordering::Acquire), "the status stage was woken");
+    assert_eq!(poll(reply.as_mut()), Poll::Ready(Err(EndpointError::Disabled)));
 }
