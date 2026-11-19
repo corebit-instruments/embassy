@@ -12,6 +12,7 @@ const GET_LINE_CODING: [u8; 8] = [0xa1, 0x21, 0, 0, 0, 0, 7, 0];
 const SET_LINE_CODING: [u8; 8] = [0x21, 0x20, 0, 0, 0, 0, 7, 0];
 const LINE_CODING_9600: [u8; 7] = [0x80, 0x25, 0, 0, 0, 0, 8];
 const LINE_CODING_115200: [u8; 7] = [0x00, 0xc2, 0x01, 0, 0, 0, 8];
+const SET_CONTROL_LINE_STATE: [u8; 8] = [0x21, 0x22, 0, 0, 0, 0, 0, 0];
 
 struct Fixture {
     _memory: Vec<u32>,
@@ -89,6 +90,16 @@ impl Fixture {
     /// instead waits forever.
     fn host_bus_event(&self, event: impl FnOnce(&mut regs::Gintsts)) {
         self.regs.gintsts().modify(|w| event(w));
+    }
+
+    /// The core finishes disabling endpoint 0 IN after the device set EPDIS:
+    /// it clears EPENA and EPDIS and flags EPDISD.
+    fn core_disables_in(&self) {
+        self.regs.diepctl(0).modify(|w| {
+            w.set_epena(false);
+            w.set_epdis(false);
+        });
+        self.regs.diepint(0).modify(|w| w.set_epdisd(true));
     }
 
     /// What `on_interrupt` does with a SETUP packet.
@@ -313,4 +324,116 @@ fn the_interrupt_wakes_a_control_stage_when_it_masks_a_bus_event() {
     unsafe { on_interrupt(fixture.regs, fixture.state, 1) };
     assert!(woken.load(Ordering::Acquire), "the status stage was woken");
     assert_eq!(poll(reply.as_mut()), Poll::Ready(Err(EndpointError::Disabled)));
+}
+
+/// The host never took GET_LINE_CODING's data packet and sent the next SETUP,
+/// SET_CONTROL_LINE_STATE as usbser sends on close. The armed packet would
+/// keep EPENA set, so the new transfer's status packet waited behind it
+/// forever and every later control transfer timed out (modulo-firmware#300).
+#[test]
+fn a_new_setup_cancels_an_in_data_stage_the_host_never_took() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.host_setup(GET_LINE_CODING);
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(GET_LINE_CODING));
+    {
+        let mut reply = core::pin::pin!(pipe.data_in(&LINE_CODING_115200, true, true));
+        assert_eq!(
+            poll(reply.as_mut()),
+            Poll::Pending,
+            "waits for the host's status packet"
+        );
+        fixture.host_setup(SET_CONTROL_LINE_STATE);
+        assert_eq!(poll(reply.as_mut()), Poll::Ready(Err(EndpointError::Disabled)));
+    }
+    assert!(fixture.regs.diepctl(0).read().epena(), "the host never took the data");
+
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(SET_CONTROL_LINE_STATE));
+    let diepctl = fixture.regs.diepctl(0).read();
+    assert!(diepctl.epdis() && diepctl.snak(), "the stale IN packet is cancelled");
+    let grstctl = fixture.regs.grstctl().read();
+    assert!(grstctl.txfflsh() && grstctl.txfnum() == 0, "TX FIFO 0 is flushed");
+
+    fixture.core_disables_in();
+    assert_eq!(poll(core::pin::pin!(pipe.accept())), Poll::Ready(()));
+    let diepctl = fixture.regs.diepctl(0).read();
+    assert!(diepctl.epena() && diepctl.cnak(), "the status packet is armed");
+    assert_eq!(
+        fixture.regs.dieptsiz(0).read().xfrsiz(),
+        0,
+        "a zero-length status packet"
+    );
+}
+
+/// Likewise when the next transfer is another control read: its reply goes out
+/// and the transfer completes.
+#[test]
+fn a_new_control_read_completes_after_an_in_data_stage_the_host_never_took() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.host_setup(GET_LINE_CODING);
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(GET_LINE_CODING));
+    {
+        let mut reply = core::pin::pin!(pipe.data_in(&LINE_CODING_9600, true, true));
+        assert_eq!(poll(reply.as_mut()), Poll::Pending);
+        fixture.host_setup(GET_LINE_CODING);
+        assert_eq!(poll(reply.as_mut()), Poll::Ready(Err(EndpointError::Disabled)));
+    }
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(GET_LINE_CODING));
+    assert!(
+        fixture.regs.diepctl(0).read().epdis(),
+        "the stale IN packet is cancelled"
+    );
+    fixture.core_disables_in();
+
+    let mut reply = core::pin::pin!(pipe.data_in(&LINE_CODING_115200, true, true));
+    assert_eq!(
+        poll(reply.as_mut()),
+        Poll::Pending,
+        "waits for the host's status packet"
+    );
+    assert_eq!(fixture.regs.dieptsiz(0).read().xfrsiz(), 7, "the new reply is armed");
+    assert!(fixture.host_out(&[]));
+    assert_eq!(poll(reply.as_mut()), Poll::Ready(Ok(())));
+}
+
+/// The host abandoned a multi-packet IN data stage after the device armed its
+/// first packet. The next packet's write waits for that one to go out; a new
+/// SETUP must end that wait, or the device never takes the SETUP.
+#[test]
+fn an_in_data_stage_ends_when_the_host_sends_a_new_setup() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.host_setup(GET_LINE_CODING);
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(GET_LINE_CODING));
+    assert_eq!(
+        poll(core::pin::pin!(pipe.data_in(&[0; 64], true, false))),
+        Poll::Ready(Ok(()))
+    );
+    {
+        let mut reply = core::pin::pin!(pipe.data_in(&LINE_CODING_115200, false, true));
+        assert_eq!(
+            poll(reply.as_mut()),
+            Poll::Pending,
+            "the host has not taken the first packet"
+        );
+        fixture.host_setup(SET_CONTROL_LINE_STATE);
+        assert_eq!(poll(reply.as_mut()), Poll::Ready(Err(EndpointError::Disabled)));
+    }
+    assert_eq!(poll(core::pin::pin!(pipe.setup())), Poll::Ready(SET_CONTROL_LINE_STATE));
+    let diepctl = fixture.regs.diepctl(0).read();
+    assert!(diepctl.epdis() && diepctl.snak(), "the stale IN packet is cancelled");
+}
+
+/// A status packet armed by `accept` waits behind an IN packet the host never
+/// took; a new SETUP ends that wait too.
+#[test]
+fn an_out_status_stage_ends_when_the_host_sends_a_new_setup() {
+    let fixture = Fixture::new();
+    let mut pipe = fixture.pipe();
+    fixture.regs.diepctl(0).modify(|w| w.set_epena(true));
+    let mut accept = core::pin::pin!(pipe.accept());
+    assert_eq!(poll(accept.as_mut()), Poll::Pending);
+    fixture.host_setup(GET_LINE_CODING);
+    assert_eq!(poll(accept.as_mut()), Poll::Ready(()));
 }

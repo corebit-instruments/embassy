@@ -66,13 +66,11 @@ pub unsafe fn on_interrupt<const MAX_EP_COUNT: usize>(r: Otg, state: &State<MAX_
                 assert!(len == 8, "invalid SETUP packet length={}", len);
                 assert!(ep_num == 0, "invalid SETUP packet endpoint={}", ep_num);
 
-                // flushing TX if something stuck in control endpoint
-                if r.dieptsiz(ep_num).read().pktcnt() != 0 {
-                    r.grstctl().modify(|w| {
-                        w.set_txfnum(ep_num as _);
-                        w.set_txfflsh(true);
-                    });
-                    while r.grstctl().read().txfflsh() {}
+                // A new SETUP ends any earlier transfer: cancel an IN packet still
+                // stuck in the control endpoint. Flushing its data without disabling
+                // it would leave EPENA set over an empty FIFO, NAKing every later IN.
+                if r.diepctl(0).read().epena() || r.dieptsiz(0).read().pktcnt() != 0 {
+                    cancel_ep0_in(r);
                 }
 
                 let data = &state.cp_state.setup_data;
@@ -1365,6 +1363,40 @@ pub struct ControlPipe<'d> {
     ep_out: Endpoint<'d, Out>,
 }
 
+/// Register polls allowed for endpoint 0 IN to reach NAK, finish disabling, or
+/// flush its FIFO. Each normally takes at most one full-speed packet time.
+const EP0_IN_CANCEL_SPINS: u32 = 10_000;
+
+fn spin_until(mut done: impl FnMut() -> bool) -> bool {
+    (0..EP0_IN_CANCEL_SPINS).any(|_| done())
+}
+
+/// Cancel an IN packet left armed on endpoint 0 by a transfer the host
+/// abandoned, and flush TX FIFO 0 (RM0399 "Disabling an IN endpoint").
+/// Callers keep the interrupt handler out, which also touches the FIFO.
+fn cancel_ep0_in(regs: Otg) {
+    if regs.diepctl(0).read().epena() {
+        regs.diepctl(0).modify(|w| w.set_snak(true));
+        spin_until(|| regs.diepint(0).read().inepne());
+        regs.diepctl(0).modify(|w| {
+            w.set_snak(true);
+            w.set_epdis(true);
+        });
+        if !spin_until(|| !regs.diepctl(0).read().epena()) {
+            warn!("control: endpoint 0 IN did not disable");
+        }
+        regs.diepint(0).write(|w| {
+            w.set_inepne(true);
+            w.set_epdisd(true);
+        });
+    }
+    regs.grstctl().modify(|w| {
+        w.set_txfnum(0);
+        w.set_txfflsh(true);
+    });
+    spin_until(|| !regs.grstctl().read().txfflsh());
+}
+
 /// Whether the core has flagged a USB reset, enumeration or suspend that
 /// `Bus::poll` has not handled yet. Each ends the current control transfer.
 /// The flags stay set until `Bus::poll` clears them, so this also covers any
@@ -1432,6 +1464,26 @@ impl<'d> ControlPipe<'d> {
         })
         .await
     }
+
+    /// Write one data- or status-stage IN packet of the current transfer. Its
+    /// write first waits for the previous IN packet to go out; a new SETUP
+    /// means the host abandoned this transfer and will never take that packet,
+    /// so end the stage and let the caller take the SETUP.
+    async fn write_stage(&mut self, data: &[u8]) -> Result<(), EndpointError> {
+        let setup_state = self.setup_state;
+        let mut write = core::pin::pin!(self.ep_in.write(data));
+        poll_fn(|cx| {
+            let abandoned = setup_state.setup_ready.load(Ordering::Acquire);
+            match write.as_mut().poll(cx) {
+                Poll::Pending if abandoned => {
+                    trace!("control: IN stage abandoned for a new SETUP");
+                    Poll::Ready(Err(EndpointError::Disabled))
+                }
+                result => result,
+            }
+        })
+        .await
+    }
 }
 
 impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
@@ -1471,6 +1523,14 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
                     }
                 });
 
+                // Likewise an IN packet still armed belongs to the abandoned transfer.
+                // The host never takes it, so its EPENA would hold this transfer's
+                // first IN write forever (modulo-firmware#300).
+                if self.regs.diepctl(0).read().epena() {
+                    warn!("control: cancelled a stale IN packet at SETUP");
+                    critical_section::with(|_| cancel_ep0_in(self.regs));
+                }
+
                 // Clear NAK to indicate we are ready to receive more data
                 self.regs
                     .doepctl(self.ep_out.info.addr.index())
@@ -1495,7 +1555,7 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
 
     async fn data_in(&mut self, data: &[u8], _first: bool, last: bool) -> Result<(), EndpointError> {
         trace!("control: data_in write: {:?}", Bytes(data));
-        Self::stage(self.regs, self.ep_in.write(data)).await?;
+        Self::stage(self.regs, self.write_stage(data)).await?;
 
         // wait for status response from host after sending the last packet
         if last {
@@ -1510,7 +1570,7 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
     async fn accept(&mut self) {
         trace!("control: accept");
 
-        Self::stage(self.regs, self.ep_in.write(&[])).await.ok();
+        Self::stage(self.regs, self.write_stage(&[])).await.ok();
 
         trace!("control: accept OK");
     }
